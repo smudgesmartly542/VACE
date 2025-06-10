@@ -1,3 +1,4 @@
+./models
 *.pyc
 *.pth
 *.pt
@@ -18,3 +19,12 @@ vace.egg-info
 *resources
 *.ipynb_checkpoints*
 *.vscode
+models/
+*.bin
+*.safetensors
+*.gguf
+models/
+processed/
+*.bin
+*.safetensors
+*.gguf

@@ -1,10 +1,20 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) Alibaba, Inc. and its affiliates.
+import os
 import torch
 import torch.cuda.amp as amp
 import torch.nn as nn
+import logging
 from diffusers.configuration_utils import register_to_config
 from wan.modules.model import WanModel, WanAttentionBlock, sinusoidal_embedding_1d
+
+# Import GGUF support
+try:
+    from ...utils.gguf_loader import load_gguf_state_dict, create_gguf_model_config, dequantize_tensor, is_quantized
+    GGUF_AVAILABLE = True
+except ImportError:
+    GGUF_AVAILABLE = False
+    logging.warning("GGUF support not available. Install 'gguf' package for quantized model support.")
 
 
 class VaceWanAttentionBlock(WanAttentionBlock):
@@ -116,6 +126,132 @@ class VaceWanModel(WanModel):
         self.vace_patch_embedding = nn.Conv3d(
             self.vace_in_dim, self.dim, kernel_size=self.patch_size, stride=self.patch_size
         )
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        """
+        Load model from pretrained path, supporting both regular and GGUF formats
+        """
+        if os.path.isdir(pretrained_model_name_or_path):
+            # Check for GGUF file in directory
+            gguf_files = [f for f in os.listdir(pretrained_model_name_or_path) if f.endswith('.gguf')]
+            if gguf_files and GGUF_AVAILABLE:
+                gguf_path = os.path.join(pretrained_model_name_or_path, gguf_files[0])
+                logging.info(f"Found GGUF file: {gguf_path}")
+                return cls.from_gguf(gguf_path, **kwargs)
+        
+        # Fallback to original diffusers loading
+        return super().from_pretrained(pretrained_model_name_or_path, **kwargs)
+    
+    @classmethod
+    def from_gguf(cls, gguf_path, device=None, **kwargs):
+        """
+        Load model from GGUF file
+        """
+        if not GGUF_AVAILABLE:
+            raise ImportError("GGUF support not available. Install 'gguf' package.")
+        
+        if device is None:
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA is required but not available!")
+            device = torch.device("cuda:0")
+        
+        logging.info(f"Loading VaceWanModel from GGUF: {gguf_path}")
+        
+        # Create config from GGUF metadata
+        config = create_gguf_model_config(gguf_path)
+        
+        # Override with any provided kwargs
+        config.update(kwargs)
+        
+        # Create model instance with correct config
+        model = cls(
+            vace_layers=config.get('vace_layers'),
+            vace_in_dim=config.get('vace_in_dim'),
+            model_type=config.get('model_type', 't2v'),
+            patch_size=config.get('patch_size', [1, 2, 2]),
+            text_len=config.get('text_len', 512),
+            in_dim=config.get('in_dim', 16),
+            dim=config.get('dim', 5120),
+            ffn_dim=config.get('ffn_dim', 13824),
+            freq_dim=config.get('freq_dim', 256),
+            text_dim=config.get('text_dim', 4096),
+            out_dim=config.get('out_dim', 16),
+            num_heads=config.get('num_heads', 40),
+            num_layers=config.get('num_layers', 40),
+            window_size=config.get('window_size', [-1, -1]),
+            qk_norm=config.get('qk_norm', True),
+            cross_attn_norm=config.get('cross_attn_norm', True),
+            eps=config.get('eps', 1e-6)
+        )
+        
+        # Load GGUF state dict
+        state_dict = load_gguf_state_dict(gguf_path, handle_prefix="")
+        
+        # Load weights with quantization support
+        model.load_gguf_state_dict(state_dict, device)
+        
+        return model.to(device)
+    
+    def load_gguf_state_dict(self, state_dict, device):
+        """
+        Load state dict with GGUF tensor handling and on-demand dequantization
+        """
+        missing_keys = []
+        unexpected_keys = []
+        
+        model_state_dict = self.state_dict()
+        
+        # Track loading progress
+        total_tensors = len(state_dict)
+        loaded_tensors = 0
+        
+        logging.info(f"Loading {total_tensors} tensors from GGUF...")
+        
+        for key, tensor in state_dict.items():
+            if key in model_state_dict:
+                # Handle quantized tensors
+                param_shape = model_state_dict[key].shape
+                if tensor.shape != param_shape:
+                    logging.warning(f"Shape mismatch for {key}: expected {param_shape}, got {tensor.shape}")
+                    unexpected_keys.append(key)
+                    continue
+                
+                # Get expected dtype
+                expected_dtype = model_state_dict[key].dtype
+                
+                if is_quantized(tensor):
+                    # Dequantize tensor
+                    logging.debug(f"Dequantizing {key} from {getattr(tensor, 'tensor_type', 'unknown')}")
+                    dequantized = dequantize_tensor(tensor, expected_dtype)
+                    
+                    # Copy the dequantized data
+                    with torch.no_grad():
+                        model_state_dict[key].copy_(dequantized)
+                else:
+                    # Regular tensor - just copy
+                    with torch.no_grad():
+                        model_state_dict[key].copy_(tensor.to(expected_dtype))
+                
+                loaded_tensors += 1
+                if loaded_tensors % 100 == 0:
+                    logging.info(f"Loaded {loaded_tensors}/{total_tensors} tensors...")
+            else:
+                unexpected_keys.append(key)
+        
+        # Check for missing keys
+        for key in model_state_dict.keys():
+            if key not in state_dict:
+                missing_keys.append(key)
+        
+        if missing_keys:
+            logging.warning(f"Missing keys in GGUF file ({len(missing_keys)}): {missing_keys[:10]}{'...' if len(missing_keys) > 10 else ''}")
+        if unexpected_keys:
+            logging.warning(f"Unexpected keys in GGUF file ({len(unexpected_keys)}): {unexpected_keys[:10]}{'...' if len(unexpected_keys) > 10 else ''}")
+        
+        logging.info(f"Successfully loaded {loaded_tensors}/{total_tensors} tensors from GGUF")
+        
+        return model_state_dict
 
     def forward_vace(
         self,
